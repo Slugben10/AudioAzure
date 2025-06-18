@@ -74,7 +74,7 @@
  [],
  False,
  False,
- 1750263477,
+ 1750270061,
  [('run.exe',
    'C:\\Users\\szabotu\\Downloads\\Keszaudio\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\run.exe',
    'EXECUTABLE')],
