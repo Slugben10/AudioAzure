@@ -19,5 +19,7 @@
         "Meeting Notes": "Please analyze this meeting transcript and create structured notes with these sections: 1) Attendees, 2) Key Discussion Points, 3) Decisions Made, 4) Action Items with Owners, 5) Next Steps",
         "Executive Summary": "Create an executive summary of this transcript. Focus on strategic implications, key decisions, and recommendations. Keep it brief but comprehensive."
     },
-    "shown_format_info": true
+    "shown_format_info": true,
+    "AZURE_STORAGE_CONNECTION_STRING": "DefaultEndpointsProtocol=https;AccountName=storageaccountforloxon;AccountKey=eNzBM8ftNJ5Kbdif3EoLyVctWeOmxcVtYrY6x2urThli6TMbQWAnNqf6zBn+mgYqiQC/0TqVUl30+AStaXJ0eQ==;EndpointSuffix=core.windows.net",
+    "AZURE_STORAGE_CONTAINER": "audio-batch"
 }

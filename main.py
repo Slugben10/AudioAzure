@@ -3,6 +3,24 @@
 import os
 import sys
 import platform
+# Load .env for local development
+try:
+    from dotenv import load_dotenv
+    import os
+    dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+    load_dotenv(dotenv_path, override=True)
+    # Fallback: manually parse .env if variable is still missing
+    if os.environ.get('AZURE_STORAGE_CONNECTION_STRING') is None:
+        with open(dotenv_path, 'r') as f:
+            for line in f:
+                if line.strip().startswith('AZURE_STORAGE_CONNECTION_STRING='):
+                    # Remove possible quotes and whitespace
+                    value = line.strip().split('=', 1)[1].strip().strip('"').strip("'")
+                    os.environ['AZURE_STORAGE_CONNECTION_STRING'] = value
+                    print('DEBUG: Fallback loaded AZURE_STORAGE_CONNECTION_STRING from .env')
+                    break
+except ImportError:
+    pass
 
 # For macOS, implement comprehensive screen access check bypass
 if platform.system() == 'darwin':
@@ -563,37 +581,65 @@ class AudioProcessor:
             raise RuntimeError(f"Error during audio conversion: {e.stderr.decode('utf-8', errors='replace')}")
     
     def transcribe_audio(self, audio_path, language=None):
-        """Transcribe audio file using the optimal Azure service based on file size."""
+        """Transcribe audio file using the optimal Azure service based on file duration and size."""
+        temp_wav_path = None
         try:
             self.update_status("Preparing audio for transcription...", percent=5)
-            
-            # Get file size in MB
-            file_size = os.path.getsize(audio_path) / (1024 * 1024)
-            
-            # Get file extension for validation
+
+            # Always convert to .wav if not already
             file_ext = os.path.splitext(audio_path)[1].lower()
-            supported_formats = ['.wav', '.ogg', '.mp3', '.flac', '.m4a', '.webm']
-            
-            # Check if format needs conversion
-            if file_ext not in supported_formats:
-                self.update_status(f"File format {file_ext} not directly supported, attempting conversion...", percent=5)
+            if file_ext != '.wav':
+                self.update_status(f"Converting {file_ext} to .wav for compatibility...", percent=5)
                 try:
-                    audio_path = self.convert_audio_file(audio_path, ".wav")
+                    temp_wav_path = self.convert_audio_file(audio_path, ".wav")
+                    wav_path = temp_wav_path
                 except Exception as e:
-                    raise ValueError(f"Unable to convert unsupported file format: {str(e)}")
-
-            # Use Azure OpenAI Whisper for files under 25MB (faster)
-            if file_size <= 25:
-                return self._transcribe_with_azure_openai(audio_path, language)
-            # Use Azure Speech Batch with Whisper for larger files
+                    raise ValueError(f"Unable to convert to .wav: {str(e)}")
             else:
-                return self._transcribe_with_azure_speech_batch(audio_path, language)
+                wav_path = audio_path
 
+            # Get file size in MB (on .wav file)
+            file_size = os.path.getsize(wav_path) / (1024 * 1024)
+
+            # Check audio duration (on .wav file)
+            duration_sec = None
+            try:
+                if LIBROSA_AVAILABLE:
+                    duration_sec = librosa.get_duration(path=wav_path)
+                else:
+                    with wave.open(wav_path, 'rb') as wf:
+                        frames = wf.getnframes()
+                        rate = wf.getframerate()
+                        duration_sec = frames / float(rate)
+            except Exception as e:
+                duration_sec = None  # If duration can't be determined, fallback to file size only
+
+            # Use Azure OpenAI Whisper for files <= 1500 seconds (25 minutes) and <= 25MB
+            if duration_sec is not None:
+                if duration_sec <= 1500 and file_size <= 25:
+                    result = self._transcribe_with_azure_openai(wav_path, language)
+                else:
+                    result = self._transcribe_with_azure_speech_batch(wav_path, language)
+            else:
+                # Fallback: if duration can't be determined, use file size as before
+                if file_size <= 25:
+                    result = self._transcribe_with_azure_openai(wav_path, language)
+                else:
+                    result = self._transcribe_with_azure_speech_batch(wav_path, language)
+
+            return result
         except Exception as e:
             error_msg = f"Error in transcription: {str(e)}"
             self.update_status(error_msg, percent=0)
             self.transcript = error_msg
             return error_msg
+        finally:
+            # Clean up temp wav file if created
+            if temp_wav_path and os.path.exists(temp_wav_path):
+                try:
+                    os.remove(temp_wav_path)
+                except Exception:
+                    pass
 
     def _transcribe_with_azure_openai(self, audio_path, language=None):
         """Use Azure OpenAI Whisper for faster transcription of smaller files."""
@@ -613,8 +659,8 @@ class AudioProcessor:
 
             # Prepare headers for Azure OpenAI API
             headers = {
-                "api-key": api_key,
-                "Content-Type": "multipart/form-data"
+                "api-key": api_key
+                # Do NOT set Content-Type here; requests will handle it for multipart
             }
 
             # Read audio file and prepare for upload
@@ -649,13 +695,47 @@ class AudioProcessor:
             return error_msg
 
     def _transcribe_with_azure_speech_batch(self, audio_path, language=None):
-        """Use Azure Speech Batch with Whisper model for larger files."""
+        """Use Azure Speech Batch with Whisper model for larger files. Uploads local files to Azure Blob Storage and uses SAS URL."""
         try:
             # Get Azure Speech configuration
             speech_config = self.config_manager.get_azure_speech_config()
             subscription_key = speech_config["api_key"]
             region = speech_config["region"]
-            
+
+            # --- Upload file to Azure Blob Storage if local ---
+            from azure.storage.blob import BlobServiceClient, ContentSettings, generate_blob_sas, BlobSasPermissions
+            import uuid
+            from datetime import datetime, timedelta
+            import os
+
+            storage_connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+            print("DEBUG: AZURE_STORAGE_CONNECTION_STRING =", storage_connection_string)  # DEBUG PRINT
+            container_name = os.environ.get("AZURE_STORAGE_CONTAINER", "audio-batch")
+            if not storage_connection_string:
+                raise Exception("Azure Storage connection string not set in environment variable AZURE_STORAGE_CONNECTION_STRING")
+
+            blob_service_client = BlobServiceClient.from_connection_string(storage_connection_string)
+            container_client = blob_service_client.get_container_client(container_name)
+            try:
+                container_client.create_container()
+            except Exception:
+                pass  # Already exists
+
+            blob_name = f"{uuid.uuid4()}_{os.path.basename(audio_path)}"
+            blob_client = container_client.get_blob_client(blob_name)
+            with open(audio_path, "rb") as data:
+                blob_client.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type="audio/wav"))
+
+            sas_token = generate_blob_sas(
+                account_name=blob_client.account_name,
+                container_name=container_name,
+                blob_name=blob_name,
+                account_key=blob_service_client.credential.account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=datetime.utcnow() + timedelta(hours=2)
+            )
+            sas_url = f"{blob_client.url}?{sas_token}"
+
             # Prepare the API request
             endpoint = f"https://{region}.api.cognitive.microsoft.com/speechtotext/transcriptions:submit"
             headers = {
@@ -663,9 +743,9 @@ class AudioProcessor:
                 "Content-Type": "application/json"
             }
 
-            # Create request body with Whisper model specified
+            # Use the SAS URL in contentUrls
             body = {
-                "contentUrls": [audio_path],
+                "contentUrls": [sas_url],
                 "locale": language or "en-US",
                 "displayName": os.path.basename(audio_path),
                 "properties": {
@@ -4499,6 +4579,39 @@ def verify_saved_settings(config_file_path):
         return "✗ Config file is not valid JSON"
     except Exception as e:
         return f"✗ Error verifying settings: {str(e)}"
+
+# Fallback: Load AZURE_STORAGE_CONNECTION_STRING and AZURE_STORAGE_CONTAINER from config.json if not set in environment
+try:
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    if os.path.exists(config_path):
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+        if os.environ.get('AZURE_STORAGE_CONNECTION_STRING') is None:
+            storage_conn = config_data.get('AZURE_STORAGE_CONNECTION_STRING')
+            if not storage_conn:
+                storage_conn = config_data.get('azure_storage_connection_string')
+            if not storage_conn:
+                storage_conn = config_data.get('azure_speech', {}).get('AZURE_STORAGE_CONNECTION_STRING')
+            if not storage_conn:
+                storage_conn = config_data.get('azure_speech', {}).get('azure_storage_connection_string')
+            if not storage_conn:
+                storage_conn = config_data.get('storage_connection_string')
+            if storage_conn:
+                os.environ['AZURE_STORAGE_CONNECTION_STRING'] = storage_conn
+        if os.environ.get('AZURE_STORAGE_CONTAINER') is None:
+            storage_container = config_data.get('AZURE_STORAGE_CONTAINER')
+            if not storage_container:
+                storage_container = config_data.get('azure_storage_container')
+            if not storage_container:
+                storage_container = config_data.get('azure_speech', {}).get('AZURE_STORAGE_CONTAINER')
+            if not storage_container:
+                storage_container = config_data.get('azure_speech', {}).get('azure_storage_container')
+            if not storage_container:
+                storage_container = config_data.get('storage_container')
+            if storage_container:
+                os.environ['AZURE_STORAGE_CONTAINER'] = storage_container
+except Exception as e:
+    print(f"Warning: Could not load storage connection info from config.json: {e}")
 
 if __name__ == "__main__":
     try:
