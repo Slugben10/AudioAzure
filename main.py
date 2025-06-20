@@ -581,66 +581,201 @@ class AudioProcessor:
             raise RuntimeError(f"Error during audio conversion: {e.stderr.decode('utf-8', errors='replace')}")
     
     def transcribe_audio(self, audio_path, language=None):
-        """Transcribe audio file using the optimal Azure service based on file duration and size."""
-        temp_wav_path = None
-        try:
-            self.update_status("Preparing audio for transcription...", percent=5)
+        """Transcribe audio file using the fastest Azure service based on file duration and size."""
+        import os
+        import wave
+        import concurrent.futures
+        import math
+        import tempfile
+        import shutil
+        from azure.storage.blob import BlobServiceClient, ContentSettings, generate_blob_sas, BlobSasPermissions
+        from datetime import datetime, timedelta
+        import requests
+        import threading
 
-            # Always convert to .wav if not already
-            file_ext = os.path.splitext(audio_path)[1].lower()
-            if file_ext != '.wav':
-                self.update_status(f"Converting {file_ext} to .wav for compatibility...", percent=5)
-                try:
-                    temp_wav_path = self.convert_audio_file(audio_path, ".wav")
-                    wav_path = temp_wav_path
-                except Exception as e:
-                    raise ValueError(f"Unable to convert to .wav: {str(e)}")
-            else:
-                wav_path = audio_path
+        def get_wav_duration_and_size(path):
+            with wave.open(path, 'rb') as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                duration = frames / float(rate)
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            return duration, size_mb
 
-            # Get file size in MB (on .wav file)
-            file_size = os.path.getsize(wav_path) / (1024 * 1024)
+        def convert_to_wav(src_path):
+            # Convert to 16kHz mono wav for best speed/accuracy
+            out_path = tempfile.mktemp(suffix='.wav')
+            cmd = [
+                'ffmpeg', '-y', '-i', src_path,
+                '-ar', '16000', '-ac', '1', out_path
+            ]
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            return out_path
 
-            # Check audio duration (on .wav file)
-            duration_sec = None
+        def split_audio_to_chunks(wav_path, chunk_sec=600):
+            with wave.open(wav_path, 'rb') as wf:
+                framerate = wf.getframerate()
+                nframes = wf.getnframes()
+                nchannels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                duration = nframes / float(framerate)
+                chunk_frames = int(chunk_sec * framerate)
+                num_chunks = math.ceil(duration / chunk_sec)
+                chunk_paths = []
+                for i in range(num_chunks):
+                    wf.setpos(i * chunk_frames)
+                    frames = wf.readframes(chunk_frames)
+                    chunk_path = tempfile.mktemp(suffix=f'_chunk_{i+1}.wav')
+                    with wave.open(chunk_path, 'wb') as out_wf:
+                        out_wf.setnchannels(nchannels)
+                        out_wf.setsampwidth(sampwidth)
+                        out_wf.setframerate(framerate)
+                        out_wf.writeframes(frames)
+                    chunk_paths.append(chunk_path)
+                return chunk_paths
+
+        # Step 1: Convert to wav if needed
+        file_ext = os.path.splitext(audio_path)[1].lower()
+        if file_ext != '.wav':
+            wav_path = convert_to_wav(audio_path)
+            cleanup_wav = True
+        else:
+            wav_path = audio_path
+            cleanup_wav = False
+
+        duration, size_mb = get_wav_duration_and_size(wav_path)
+
+        # Step 2: Use Fast API if eligible
+        if duration <= 7200 and size_mb <= 300:
             try:
-                if LIBROSA_AVAILABLE:
-                    duration_sec = librosa.get_duration(path=wav_path)
-                else:
-                    with wave.open(wav_path, 'rb') as wf:
-                        frames = wf.getnframes()
-                        rate = wf.getframerate()
-                        duration_sec = frames / float(rate)
+                self.update_status("Transcribing with Azure Fast Transcription API...", percent=10)
+                # Use Azure Speech SDK for fast API
+                import azure.cognitiveservices.speech as speechsdk
+                speech_config = self.config_manager.get_azure_speech_config()
+                api_key = speech_config["api_key"]
+                region = speech_config["region"]
+                speech_config_obj = speechsdk.SpeechConfig(subscription=api_key, region=region)
+                audio_input = speechsdk.AudioConfig(filename=wav_path)
+                recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config_obj, audio_config=audio_input)
+                done = threading.Event()
+                all_text = []
+                def handle_final(evt):
+                    if evt.result.text:
+                        all_text.append(evt.result.text)
+                recognizer.recognized.connect(handle_final)
+                recognizer.session_stopped.connect(lambda evt: done.set())
+                recognizer.canceled.connect(lambda evt: done.set())
+                recognizer.start_continuous_recognition()
+                done.wait()
+                recognizer.stop_continuous_recognition()
+                self.transcript = '\n'.join(all_text)
+                self.update_status("Transcription complete (fast API)", percent=100)
+                return self.transcript
             except Exception as e:
-                duration_sec = None  # If duration can't be determined, fallback to file size only
+                self.update_status(f"Fast API failed, falling back to batch: {e}", percent=20)
+                # Fallback to batch
 
-            # Use Azure OpenAI Whisper for files <= 1500 seconds (25 minutes) and <= 25MB
-            if duration_sec is not None:
-                if duration_sec <= 1500 and file_size <= 25:
-                    result = self._transcribe_with_azure_openai(wav_path, language)
-                else:
-                    result = self._transcribe_with_azure_speech_batch(wav_path, language)
-            else:
-                # Fallback: if duration can't be determined, use file size as before
-                if file_size <= 25:
-                    result = self._transcribe_with_azure_openai(wav_path, language)
-                else:
-                    result = self._transcribe_with_azure_speech_batch(wav_path, language)
-
-            return result
-        except Exception as e:
-            error_msg = f"Error in transcription: {str(e)}"
-            self.update_status(error_msg, percent=0)
-            self.transcript = error_msg
-            return error_msg
-        finally:
-            # Clean up temp wav file if created
-            if temp_wav_path and os.path.exists(temp_wav_path):
+        # Step 3: For large files, chunk, upload, and batch transcribe
+        self.update_status("Preparing for batch transcription (chunking and uploading)...", percent=20)
+        chunk_paths = split_audio_to_chunks(wav_path, chunk_sec=600) if duration > 600 else [wav_path]
+        storage_connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        container_name = os.environ.get("AZURE_STORAGE_CONTAINER", "audio-batch")
+        blob_service_client = BlobServiceClient.from_connection_string(storage_connection_string)
+        container_client = blob_service_client.get_container_client(container_name)
+        try:
+            container_client.create_container()
+        except Exception:
+            pass
+        def upload_chunk(chunk_path):
+            blob_name = f"{uuid.uuid4()}_{os.path.basename(chunk_path)}"
+            blob_client = container_client.get_blob_client(blob_name)
+            with open(chunk_path, "rb") as data:
+                blob_client.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type="audio/wav"))
+            sas_token = generate_blob_sas(
+                account_name=blob_client.account_name,
+                container_name=container_name,
+                blob_name=blob_name,
+                account_key=blob_service_client.credential.account_key,
+                permission=BlobSasPermissions(read=True),
+                expiry=datetime.utcnow() + timedelta(hours=2)
+            )
+            return f"{blob_client.url}?{sas_token}", blob_name
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            results = list(executor.map(upload_chunk, chunk_paths))
+        sas_urls = [r[0] for r in results]
+        blob_names = [r[1] for r in results]
+        # Step 4: Submit batch job
+        speech_config = self.config_manager.get_azure_speech_config()
+        subscription_key = speech_config["api_key"]
+        region = speech_config["region"]
+        api_version = "2024-11-15"
+        endpoint = f"https://{region}.api.cognitive.microsoft.com/speechtotext/transcriptions:submit?api-version={api_version}"
+        headers = {
+            "Ocp-Apim-Subscription-Key": subscription_key,
+            "Content-Type": "application/json"
+        }
+        body = {
+            "contentUrls": sas_urls,
+            "locale": language or "en-US",
+            "displayName": os.path.basename(audio_path),
+            "properties": {
+                "displayFormWordLevelTimestampsEnabled": True,
+                "timeToLiveHours": 48
+            }
+        }
+        self.update_status("Submitting batch transcription job...", percent=40)
+        response = requests.post(endpoint, headers=headers, json=body)
+        response.raise_for_status()
+        transcription = response.json()
+        transcription_url = transcription["self"]
+        # Step 5: Poll for completion (exponential backoff)
+        self.update_status("Processing transcription... (polling)", percent=60)
+        poll_interval = 5
+        while True:
+            resp = requests.get(transcription_url, headers=headers)
+            resp.raise_for_status()
+            status = resp.json()
+            if status["status"] == "Succeeded":
+                break
+            elif status["status"] in ["Failed", "Deleted"]:
+                raise Exception(f"Transcription failed with status: {status['status']}")
+            time.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.5, 60)
+        # Step 6: Get results
+        self.update_status("Retrieving transcription results...", percent=90)
+        files_url = status["links"]["files"]
+        resp = requests.get(files_url, headers=headers)
+        resp.raise_for_status()
+        files = resp.json()
+        combined_transcript = []
+        for file in files["values"]:
+            if file["kind"] == "Transcription":
+                r = requests.get(file["links"]["contentUrl"])
+                r.raise_for_status()
+                transcription_result = r.json()
+                for segment in transcription_result["combinedRecognizedPhrases"]:
+                    combined_transcript.append(segment["display"])
+        self.transcript = " ".join(combined_transcript)
+        self.update_status("Transcription complete (batch)", percent=100)
+        # Step 7: Clean up temp files and blobs
+        for chunk_path in chunk_paths:
+            if chunk_path != audio_path and os.path.exists(chunk_path):
                 try:
-                    os.remove(temp_wav_path)
+                    os.remove(chunk_path)
                 except Exception:
                     pass
-
+        if cleanup_wav and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+        # Optionally, delete blobs from storage (uncomment if desired)
+        # for blob_name in blob_names:
+        #     try:
+        #         container_client.delete_blob(blob_name)
+        #     except Exception:
+        #         pass
+        return self.transcript
+    
     def _transcribe_with_azure_openai(self, audio_path, language=None):
         """Use Azure OpenAI Whisper for faster transcription of smaller files."""
         try:
