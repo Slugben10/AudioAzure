@@ -695,25 +695,63 @@ class AudioProcessor:
             return error_msg
 
     def _transcribe_with_azure_speech_batch(self, audio_path, language=None):
-        """Use Azure Speech Batch with Whisper model for larger files. Uploads local files to Azure Blob Storage and uses SAS URL."""
+        """Use Azure Speech Batch with Whisper model for larger files. Uploads local files to Azure Blob Storage and uses SAS URL. Implements parallel chunking for long files."""
         try:
-            # Get Azure Speech configuration
-            speech_config = self.config_manager.get_azure_speech_config()
-            subscription_key = speech_config["api_key"]
-            region = speech_config["region"]
-
-            # --- Upload file to Azure Blob Storage if local ---
+            import math
             from azure.storage.blob import BlobServiceClient, ContentSettings, generate_blob_sas, BlobSasPermissions
             import uuid
             from datetime import datetime, timedelta
             import os
+            import concurrent.futures
+            import wave
+
+            speech_config = self.config_manager.get_azure_speech_config()
+            subscription_key = speech_config["api_key"]
+            region = speech_config["region"]
 
             storage_connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-            print("DEBUG: AZURE_STORAGE_CONNECTION_STRING =", storage_connection_string)  # DEBUG PRINT
             container_name = os.environ.get("AZURE_STORAGE_CONTAINER", "audio-batch")
             if not storage_connection_string:
                 raise Exception("Azure Storage connection string not set in environment variable AZURE_STORAGE_CONNECTION_STRING")
 
+            # Helper to split audio into chunks if needed
+            def split_audio_to_chunks(audio_path, chunk_length_sec=600):
+                """Split audio into chunks of chunk_length_sec (default 10 min). Returns list of chunk file paths."""
+                with wave.open(audio_path, 'rb') as wf:
+                    framerate = wf.getframerate()
+                    nframes = wf.getnframes()
+                    nchannels = wf.getnchannels()
+                    sampwidth = wf.getsampwidth()
+                    duration = nframes / float(framerate)
+                    chunk_frames = int(chunk_length_sec * framerate)
+                    num_chunks = math.ceil(duration / chunk_length_sec)
+                    chunk_paths = []
+                    for i in range(num_chunks):
+                        wf.setpos(i * chunk_frames)
+                        frames = wf.readframes(chunk_frames)
+                        chunk_path = f"{audio_path}_chunk_{i+1}.wav"
+                        with wave.open(chunk_path, 'wb') as out_wf:
+                            out_wf.setnchannels(nchannels)
+                            out_wf.setsampwidth(sampwidth)
+                            out_wf.setframerate(framerate)
+                            out_wf.writeframes(frames)
+                        chunk_paths.append(chunk_path)
+                    return chunk_paths
+
+            # Check audio duration
+            with wave.open(audio_path, 'rb') as wf:
+                framerate = wf.getframerate()
+                nframes = wf.getnframes()
+                duration_sec = nframes / float(framerate)
+
+            # If audio is longer than 10 minutes, split into 10-min chunks
+            if duration_sec > 600:
+                self.update_status("Splitting audio into 10-min chunks for parallel batch processing...", percent=10)
+                chunk_paths = split_audio_to_chunks(audio_path, chunk_length_sec=600)
+            else:
+                chunk_paths = [audio_path]
+
+            # Upload all chunks in parallel to blob storage and collect SAS URLs
             blob_service_client = BlobServiceClient.from_connection_string(storage_connection_string)
             container_client = blob_service_client.get_container_client(container_name)
             try:
@@ -721,94 +759,88 @@ class AudioProcessor:
             except Exception:
                 pass  # Already exists
 
-            blob_name = f"{uuid.uuid4()}_{os.path.basename(audio_path)}"
-            blob_client = container_client.get_blob_client(blob_name)
-            with open(audio_path, "rb") as data:
-                blob_client.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type="audio/wav"))
+            def upload_chunk(chunk_path):
+                blob_name = f"{uuid.uuid4()}_{os.path.basename(chunk_path)}"
+                blob_client = container_client.get_blob_client(blob_name)
+                with open(chunk_path, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type="audio/wav"))
+                sas_token = generate_blob_sas(
+                    account_name=blob_client.account_name,
+                    container_name=container_name,
+                    blob_name=blob_name,
+                    account_key=blob_service_client.credential.account_key,
+                    permission=BlobSasPermissions(read=True),
+                    expiry=datetime.utcnow() + timedelta(hours=2)
+                )
+                return f"{blob_client.url}?{sas_token}"
 
-            sas_token = generate_blob_sas(
-                account_name=blob_client.account_name,
-                container_name=container_name,
-                blob_name=blob_name,
-                account_key=blob_service_client.credential.account_key,
-                permission=BlobSasPermissions(read=True),
-                expiry=datetime.utcnow() + timedelta(hours=2)
-            )
-            sas_url = f"{blob_client.url}?{sas_token}"
+            self.update_status("Uploading audio chunks to Azure Blob Storage in parallel...", percent=20)
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                sas_urls = list(executor.map(upload_chunk, chunk_paths))
 
-            # Prepare the API request
-            endpoint = f"https://{region}.api.cognitive.microsoft.com/speechtotext/transcriptions:submit"
+            # Prepare the API request (use latest API version and correct endpoint)
+            api_version = "2024-11-15"
+            endpoint = f"https://{region}.api.cognitive.microsoft.com/speechtotext/transcriptions:submit?api-version={api_version}"
             headers = {
                 "Ocp-Apim-Subscription-Key": subscription_key,
                 "Content-Type": "application/json"
             }
-
-            # Use the SAS URL in contentUrls
             body = {
-                "contentUrls": [sas_url],
+                "contentUrls": sas_urls,
                 "locale": language or "en-US",
                 "displayName": os.path.basename(audio_path),
                 "properties": {
-                    "wordLevelTimestampsEnabled": True,
-                    "timeToLiveHours": 48,
-                    "model": {
-                        "self": "whisper"
-                    }
+                    "displayFormWordLevelTimestampsEnabled": True,
+                    "timeToLiveHours": 48
                 }
             }
 
-            # Submit transcription request
-            self.update_status("Submitting to Azure Speech Batch with Whisper...", percent=20)
+            self.update_status("Submitting batch transcription job...", percent=40)
             response = requests.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             transcription = response.json()
-            
-            # Get transcription ID from response
             transcription_url = transcription["self"]
-            
+
             # Poll for completion
-            self.update_status("Processing transcription...", percent=40)
+            self.update_status("Processing transcription... (polling)", percent=60)
             while True:
                 response = requests.get(transcription_url, headers=headers)
                 response.raise_for_status()
                 status = response.json()
-                
                 if status["status"] == "Succeeded":
                     break
                 elif status["status"] in ["Failed", "Deleted"]:
                     raise Exception(f"Transcription failed with status: {status['status']}")
-                
-                time.sleep(5)  # Wait before polling again
-                
+                time.sleep(5)
+
             # Get results
-            self.update_status("Retrieving transcription results...", percent=80)
+            self.update_status("Retrieving transcription results...", percent=90)
             files_url = status["links"]["files"]
             response = requests.get(files_url, headers=headers)
             response.raise_for_status()
             files = response.json()
-            
-            # Get transcription file
+            combined_transcript = []
             for file in files["values"]:
                 if file["kind"] == "Transcription":
                     response = requests.get(file["links"]["contentUrl"])
                     response.raise_for_status()
                     transcription_result = response.json()
-                    
-                    # Extract combined transcription
-                    combined_transcript = []
                     for segment in transcription_result["combinedRecognizedPhrases"]:
                         combined_transcript.append(segment["display"])
-                    
-                    self.transcript = " ".join(combined_transcript)
-                    break
-                
+            self.transcript = " ".join(combined_transcript)
             self.update_status("Transcription complete", percent=100)
+            # Clean up chunk files if created
+            for chunk_path in chunk_paths:
+                if chunk_path != audio_path and os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except Exception:
+                        pass
             return self.transcript
-
         except Exception as e:
             error_msg = f"Error in Azure Speech Batch transcription: {str(e)}"
             self.update_status(error_msg, percent=0)
-            self.transcript = error_msg  # Set transcript to error message
+            self.transcript = error_msg
             return error_msg
     
     def _get_ffmpeg_install_instructions(self):
