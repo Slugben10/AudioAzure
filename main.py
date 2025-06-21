@@ -1754,28 +1754,22 @@ class MainFrame(wx.Frame):
             
     def show_summary_dialog(self, summary):
         """Show summary in a dialog."""
+        self.last_summary_text = summary  # Store the summary for later saving
         dlg = wx.Dialog(self, title="Summary", size=(600, 400))
         sizer = wx.BoxSizer(wx.VERTICAL)
-        
         text_ctrl = wx.TextCtrl(dlg, style=wx.TE_MULTILINE | wx.TE_READONLY)
         text_ctrl.SetValue(summary)
-        
         sizer.Add(text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
-        
         # Add Close button
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         close_btn = wx.Button(dlg, wx.ID_CLOSE)
         btn_sizer.Add(close_btn, 0, wx.ALL, 5)
-        
         sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
-        
         dlg.SetSizer(sizer)
-        
         close_btn.Bind(wx.EVT_BUTTON, lambda event: dlg.EndModal(wx.ID_CLOSE))
-        
         dlg.ShowModal()
         dlg.Destroy()
-        
+    
     def update_button_states(self):
         """Update the enabled/disabled states of buttons based on current state."""
         has_audio_file = bool(self.audio_file_path.GetValue())
@@ -2411,14 +2405,21 @@ class MainFrame(wx.Frame):
             save_dir = os.path.join(base_dir, "Transcripts")
             os.makedirs(save_dir, exist_ok=True)
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = os.path.join(save_dir, f"transcript_{timestamp}.txt")
-            try:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(transcript)
-                self.last_saved_transcript_path = filename
-                wx.MessageBox(f"Transcript saved to:\n{filename}", "Success", wx.OK | wx.ICON_INFORMATION)
-            except Exception as e:
-                wx.MessageBox(f"Failed to save transcript: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            # Ask user for a name
+            dlg = wx.TextEntryDialog(panel, "Enter a name for the transcript file (no extension):", "Save Transcript", f"transcript_{timestamp}")
+            if dlg.ShowModal() == wx.ID_OK:
+                custom_name = dlg.GetValue().strip()
+                if not custom_name:
+                    custom_name = f"transcript_{timestamp}"
+                filename = os.path.join(save_dir, f"{custom_name}.txt")
+                try:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(transcript)
+                    self.last_saved_transcript_path = filename
+                    wx.MessageBox(f"Transcript saved to:\n{filename}", "Success", wx.OK | wx.ICON_INFORMATION)
+                except Exception as e:
+                    wx.MessageBox(f"Failed to save transcript: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            dlg.Destroy()
 
         # Recall transcript handler
         def on_recall_transcript(event):
@@ -2514,14 +2515,21 @@ class MainFrame(wx.Frame):
             save_dir = os.path.join(base_dir, "Summaries")
             os.makedirs(save_dir, exist_ok=True)
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = os.path.join(save_dir, f"summary_{timestamp}.txt")
-            try:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(summary)
-                self.last_saved_summary_path = filename
-                wx.MessageBox(f"Summary saved to:\n{filename}", "Success", wx.OK | wx.ICON_INFORMATION)
-            except Exception as e:
-                wx.MessageBox(f"Failed to save summary: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            # Ask user for a name
+            dlg = wx.TextEntryDialog(panel, "Enter a name for the summary file (no extension):", "Save Summary", f"summary_{timestamp}")
+            if dlg.ShowModal() == wx.ID_OK:
+                custom_name = dlg.GetValue().strip()
+                if not custom_name:
+                    custom_name = f"summary_{timestamp}"
+                filename = os.path.join(save_dir, f"{custom_name}.txt")
+                try:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(summary)
+                    self.last_saved_summary_path = filename
+                    wx.MessageBox(f"Summary saved to:\n{filename}", "Success", wx.OK | wx.ICON_INFORMATION)
+                except Exception as e:
+                    wx.MessageBox(f"Failed to save summary: {e}", "Error", wx.OK | wx.ICON_ERROR)
+            dlg.Destroy()
 
         # Recall summary handler
         def on_recall_summary(event):
