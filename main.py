@@ -85,6 +85,8 @@ import pickle
 import types
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
+from dataclasses import dataclass
+import math
 
 # Make wx imports without errors
 try:
@@ -581,19 +583,27 @@ class AudioProcessor:
             raise RuntimeError(f"Error during audio conversion: {e.stderr.decode('utf-8', errors='replace')}")
     
     def transcribe_audio(self, audio_path, language=None):
-        """Transcribe audio file using the fastest Azure service based on file duration and size."""
+        """Transcribe audio file using Azure Speech SDK with smart chunking for large files."""
         import os
         import wave
-        import concurrent.futures
         import math
         import tempfile
         import shutil
-        from azure.storage.blob import BlobServiceClient, ContentSettings, generate_blob_sas, BlobSasPermissions
-        from datetime import datetime, timedelta
-        import requests
         import threading
+        import time
+        from dataclasses import dataclass
+        from typing import List, Tuple
+
+        @dataclass
+        class TranscriptionSegment:
+            """Represents a transcribed segment with timing information."""
+            text: str
+            start_time: float
+            end_time: float
+            chunk_index: int
 
         def get_wav_duration_and_size(path):
+            """Get duration in seconds and size in MB of a WAV file."""
             with wave.open(path, 'rb') as wf:
                 frames = wf.getnframes()
                 rate = wf.getframerate()
@@ -602,7 +612,7 @@ class AudioProcessor:
             return duration, size_mb
 
         def convert_to_wav(src_path):
-            # Convert to 16kHz mono wav for best speed/accuracy
+            """Convert audio file to 16kHz mono WAV format."""
             out_path = tempfile.mktemp(suffix='.wav')
             cmd = [
                 'ffmpeg', '-y', '-i', src_path,
@@ -611,373 +621,218 @@ class AudioProcessor:
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
             return out_path
 
-        def split_audio_to_chunks(wav_path, chunk_sec=600):
+        def calculate_optimal_chunk_size(duration_sec, size_mb):
+            """Calculate optimal chunk size based on duration and size limits."""
+            # Limits: 300MB and 7200 seconds (2 hours)
+            max_duration = 7200  # 2 hours in seconds
+            max_size_mb = 300
+            
+            # Calculate chunk size based on duration
+            duration_based_chunks = math.ceil(duration_sec / max_duration)
+            
+            # Calculate chunk size based on file size
+            size_based_chunks = math.ceil(size_mb / max_size_mb)
+            
+            # Use the larger number of chunks to ensure both limits are met
+            num_chunks = max(duration_based_chunks, size_based_chunks)
+            
+            # Calculate chunk duration, ensuring it doesn't exceed max_duration
+            chunk_duration = min(duration_sec / num_chunks, max_duration)
+            
+            return int(chunk_duration)
+
+        def split_audio_to_chunks(wav_path, chunk_sec):
+            """Split audio into chunks of specified duration in seconds."""
             with wave.open(wav_path, 'rb') as wf:
                 framerate = wf.getframerate()
                 nframes = wf.getnframes()
                 nchannels = wf.getnchannels()
                 sampwidth = wf.getsampwidth()
                 duration = nframes / float(framerate)
+                
                 chunk_frames = int(chunk_sec * framerate)
                 num_chunks = math.ceil(duration / chunk_sec)
                 chunk_paths = []
+                
                 for i in range(num_chunks):
-                    wf.setpos(i * chunk_frames)
-                    frames = wf.readframes(chunk_frames)
-                    chunk_path = tempfile.mktemp(suffix=f'_chunk_{i+1}.wav')
+                    start_frame = i * chunk_frames
+                    wf.setpos(start_frame)
+                    
+                    # Read frames for this chunk
+                    frames_to_read = min(chunk_frames, nframes - start_frame)
+                    frames = wf.readframes(frames_to_read)
+                    
+                    # Create temporary chunk file
+                    chunk_path = tempfile.mktemp(suffix=f'_chunk_{i+1:03d}.wav')
                     with wave.open(chunk_path, 'wb') as out_wf:
                         out_wf.setnchannels(nchannels)
                         out_wf.setsampwidth(sampwidth)
                         out_wf.setframerate(framerate)
                         out_wf.writeframes(frames)
+                    
                     chunk_paths.append(chunk_path)
+                
                 return chunk_paths
 
-        # Step 1: Convert to wav if needed
+        def transcribe_chunk_with_speech_sdk(chunk_path, chunk_index, chunk_start_time, language=None):
+            """Transcribe a single chunk using Azure Speech SDK."""
+            try:
+                import azure.cognitiveservices.speech as speechsdk
+                
+                # Get Azure Speech configuration
+                speech_config = self.config_manager.get_azure_speech_config()
+                api_key = speech_config["api_key"]
+                region = speech_config["region"]
+                
+                # Configure speech recognition
+                speech_config_obj = speechsdk.SpeechConfig(subscription=api_key, region=region)
+                audio_input = speechsdk.AudioConfig(filename=chunk_path)
+                recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config_obj, audio_config=audio_input)
+                
+                # Set language if specified
+                if language:
+                    speech_config_obj.speech_recognition_language = language
+                
+                # Collect transcription results
+                segments = []
+                done = threading.Event()
+                
+                def handle_final(evt):
+                    if evt.result.text:
+                        # Calculate timing relative to the original audio
+                        segment_start = chunk_start_time
+                        segment_end = chunk_start_time + (len(segments) * 2.0)  # Approximate timing
+                        
+                        segments.append(TranscriptionSegment(
+                            text=evt.result.text,
+                            start_time=segment_start,
+                            end_time=segment_end,
+                            chunk_index=chunk_index
+                        ))
+                
+                def handle_session_stopped(evt):
+                    done.set()
+                
+                def handle_canceled(evt):
+                    done.set()
+                
+                # Connect event handlers
+                recognizer.recognized.connect(handle_final)
+                recognizer.session_stopped.connect(handle_session_stopped)
+                recognizer.canceled.connect(handle_canceled)
+                
+                # Start recognition
+                recognizer.start_continuous_recognition()
+                done.wait()
+                recognizer.stop_continuous_recognition()
+                
+                return segments
+                
+            except Exception as e:
+                self.update_status(f"Error transcribing chunk {chunk_index}: {str(e)}", percent=None)
+                return []
+
+        def combine_transcript_segments(segments, chunk_duration):
+            """Combine transcription segments from multiple chunks into a single transcript."""
+            if not segments:
+                return ""
+            
+            # Sort segments by chunk index and timing
+            sorted_segments = sorted(segments, key=lambda s: (s.chunk_index, s.start_time))
+            
+            # Combine text with proper spacing
+            combined_text = []
+            for segment in sorted_segments:
+                # Add chunk separator for debugging (optional)
+                # if segment.chunk_index > 0 and segment.start_time == 0:
+                #     combined_text.append(f"\n[Chunk {segment.chunk_index}]\n")
+                
+                combined_text.append(segment.text)
+            
+            return " ".join(combined_text)
+
+        # Step 1: Convert to WAV if needed
         file_ext = os.path.splitext(audio_path)[1].lower()
         if file_ext != '.wav':
+            self.update_status("Converting audio to WAV format...", percent=5)
             wav_path = convert_to_wav(audio_path)
             cleanup_wav = True
         else:
             wav_path = audio_path
             cleanup_wav = False
 
-        duration, size_mb = get_wav_duration_and_size(wav_path)
-
-        # Step 2: Use Fast API if eligible
-        if duration <= 7200 and size_mb <= 300:
-            try:
-                self.update_status("Transcribing with Azure Fast Transcription API...", percent=10)
-                # Use Azure Speech SDK for fast API
-                import azure.cognitiveservices.speech as speechsdk
-                speech_config = self.config_manager.get_azure_speech_config()
-                api_key = speech_config["api_key"]
-                region = speech_config["region"]
-                speech_config_obj = speechsdk.SpeechConfig(subscription=api_key, region=region)
-                audio_input = speechsdk.AudioConfig(filename=wav_path)
-                recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config_obj, audio_config=audio_input)
-                done = threading.Event()
-                all_text = []
-                def handle_final(evt):
-                    if evt.result.text:
-                        all_text.append(evt.result.text)
-                recognizer.recognized.connect(handle_final)
-                recognizer.session_stopped.connect(lambda evt: done.set())
-                recognizer.canceled.connect(lambda evt: done.set())
-                recognizer.start_continuous_recognition()
-                done.wait()
-                recognizer.stop_continuous_recognition()
-                self.transcript = '\n'.join(all_text)
-                self.update_status("Transcription complete (fast API)", percent=100)
-                return self.transcript
-            except Exception as e:
-                self.update_status(f"Fast API failed, falling back to batch: {e}", percent=20)
-                # Fallback to batch
-
-        # Step 3: For large files, chunk, upload, and batch transcribe
-        self.update_status("Preparing for batch transcription (chunking and uploading)...", percent=20)
-        chunk_paths = split_audio_to_chunks(wav_path, chunk_sec=600) if duration > 600 else [wav_path]
-        storage_connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-        container_name = os.environ.get("AZURE_STORAGE_CONTAINER", "audio-batch")
-        blob_service_client = BlobServiceClient.from_connection_string(storage_connection_string)
-        container_client = blob_service_client.get_container_client(container_name)
         try:
-            container_client.create_container()
-        except Exception:
-            pass
-        def upload_chunk(chunk_path):
-            blob_name = f"{uuid.uuid4()}_{os.path.basename(chunk_path)}"
-            blob_client = container_client.get_blob_client(blob_name)
-            with open(chunk_path, "rb") as data:
-                blob_client.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type="audio/wav"))
-            sas_token = generate_blob_sas(
-                account_name=blob_client.account_name,
-                container_name=container_name,
-                blob_name=blob_name,
-                account_key=blob_service_client.credential.account_key,
-                permission=BlobSasPermissions(read=True),
-                expiry=datetime.utcnow() + timedelta(hours=2)
-            )
-            return f"{blob_client.url}?{sas_token}", blob_name
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            results = list(executor.map(upload_chunk, chunk_paths))
-        sas_urls = [r[0] for r in results]
-        blob_names = [r[1] for r in results]
-        # Step 4: Submit batch job
-        speech_config = self.config_manager.get_azure_speech_config()
-        subscription_key = speech_config["api_key"]
-        region = speech_config["region"]
-        api_version = "2024-11-15"
-        endpoint = f"https://{region}.api.cognitive.microsoft.com/speechtotext/transcriptions:submit?api-version={api_version}"
-        headers = {
-            "Ocp-Apim-Subscription-Key": subscription_key,
-            "Content-Type": "application/json"
-        }
-        body = {
-            "contentUrls": sas_urls,
-            "locale": language or "en-US",
-            "displayName": os.path.basename(audio_path),
-            "properties": {
-                "displayFormWordLevelTimestampsEnabled": True,
-                "timeToLiveHours": 48
-            }
-        }
-        self.update_status("Submitting batch transcription job...", percent=40)
-        response = requests.post(endpoint, headers=headers, json=body)
-        response.raise_for_status()
-        transcription = response.json()
-        transcription_url = transcription["self"]
-        # Step 5: Poll for completion (exponential backoff)
-        self.update_status("Processing transcription... (polling)", percent=60)
-        poll_interval = 5
-        while True:
-            resp = requests.get(transcription_url, headers=headers)
-            resp.raise_for_status()
-            status = resp.json()
-            if status["status"] == "Succeeded":
-                break
-            elif status["status"] in ["Failed", "Deleted"]:
-                raise Exception(f"Transcription failed with status: {status['status']}")
-            time.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.5, 60)
-        # Step 6: Get results
-        self.update_status("Retrieving transcription results...", percent=90)
-        files_url = status["links"]["files"]
-        resp = requests.get(files_url, headers=headers)
-        resp.raise_for_status()
-        files = resp.json()
-        combined_transcript = []
-        for file in files["values"]:
-            if file["kind"] == "Transcription":
-                r = requests.get(file["links"]["contentUrl"])
-                r.raise_for_status()
-                transcription_result = r.json()
-                for segment in transcription_result["combinedRecognizedPhrases"]:
-                    combined_transcript.append(segment["display"])
-        self.transcript = " ".join(combined_transcript)
-        self.update_status("Transcription complete (batch)", percent=100)
-        # Step 7: Clean up temp files and blobs
-        for chunk_path in chunk_paths:
-            if chunk_path != audio_path and os.path.exists(chunk_path):
-                try:
-                    os.remove(chunk_path)
-                except Exception:
-                    pass
-        if cleanup_wav and os.path.exists(wav_path):
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
-        # Optionally, delete blobs from storage (uncomment if desired)
-        # for blob_name in blob_names:
-        #     try:
-        #         container_client.delete_blob(blob_name)
-        #     except Exception:
-        #         pass
-        return self.transcript
-    
-    def _transcribe_with_azure_openai(self, audio_path, language=None):
-        """Use Azure OpenAI Whisper for faster transcription of smaller files."""
-        try:
-            # Get Azure OpenAI configuration
-            deployment_name = self.config_manager.get_azure_deployment("whisper")
-            if not deployment_name:
-                raise ValueError("Whisper deployment name not configured in Azure OpenAI settings.")
-
-            api_key = self.config_manager.get_azure_api_key()
-            if not api_key:
-                raise ValueError("Azure OpenAI API key not configured.")
-
-            endpoint = self.config_manager.get_azure_endpoint()
-            if not endpoint:
-                raise ValueError("Azure OpenAI endpoint not configured.")
-
-            # Prepare headers for Azure OpenAI API
-            headers = {
-                "api-key": api_key
-                # Do NOT set Content-Type here; requests will handle it for multipart
-            }
-
-            # Read audio file and prepare for upload
-            with open(audio_path, 'rb') as audio_file:
-                files = {
-                    'file': (os.path.basename(audio_path), audio_file, 'application/octet-stream'),
-                    'model': (None, deployment_name),
-                    'language': (None, language if language else 'en')
-                }
-
-                # Submit to Azure OpenAI Whisper endpoint
-                self.update_status("Transcribing with Azure OpenAI Whisper...", percent=20)
-                response = requests.post(
-                    f"{endpoint}/openai/deployments/{deployment_name}/audio/transcriptions?api-version={self.config_manager.get_azure_api_version()}",
-                    headers=headers,
-                    files=files
-                )
+            # Step 2: Analyze audio file
+            self.update_status("Analyzing audio file...", percent=10)
+            duration, size_mb = get_wav_duration_and_size(wav_path)
+            
+            self.update_status(f"Audio: {duration:.1f}s, {size_mb:.1f}MB", percent=15)
+            
+            # Step 3: Determine if chunking is needed
+            needs_chunking = duration > 7200 or size_mb > 300
+            
+            if needs_chunking:
+                # Calculate optimal chunk size
+                chunk_duration = calculate_optimal_chunk_size(duration, size_mb)
+                num_chunks = math.ceil(duration / chunk_duration)
                 
-                if response.status_code != 200:
-                    raise Exception(f"Transcription failed: {response.text}")
-
-                result = response.json()
-                self.transcript = result.get('text', '')
+                self.update_status(f"Splitting audio into {num_chunks} chunks of ~{chunk_duration}s each...", percent=20)
                 
-                self.update_status("Transcription complete", percent=100)
-                return self.transcript
-
-        except Exception as e:
-            error_msg = f"Error in Azure OpenAI transcription: {str(e)}"
-            self.update_status(error_msg, percent=0)
-            self.transcript = error_msg  # Set transcript to error message
-            return error_msg
-
-    def _transcribe_with_azure_speech_batch(self, audio_path, language=None):
-        """Use Azure Speech Batch with Whisper model for larger files. Uploads local files to Azure Blob Storage and uses SAS URL. Implements parallel chunking for long files."""
-        try:
-            import math
-            from azure.storage.blob import BlobServiceClient, ContentSettings, generate_blob_sas, BlobSasPermissions
-            import uuid
-            from datetime import datetime, timedelta
-            import os
-            import concurrent.futures
-            import wave
-
-            speech_config = self.config_manager.get_azure_speech_config()
-            subscription_key = speech_config["api_key"]
-            region = speech_config["region"]
-
-            storage_connection_string = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-            container_name = os.environ.get("AZURE_STORAGE_CONTAINER", "audio-batch")
-            if not storage_connection_string:
-                raise Exception("Azure Storage connection string not set in environment variable AZURE_STORAGE_CONNECTION_STRING")
-
-            # Helper to split audio into chunks if needed
-            def split_audio_to_chunks(audio_path, chunk_length_sec=600):
-                """Split audio into chunks of chunk_length_sec (default 10 min). Returns list of chunk file paths."""
-                with wave.open(audio_path, 'rb') as wf:
-                    framerate = wf.getframerate()
-                    nframes = wf.getnframes()
-                    nchannels = wf.getnchannels()
-                    sampwidth = wf.getsampwidth()
-                    duration = nframes / float(framerate)
-                    chunk_frames = int(chunk_length_sec * framerate)
-                    num_chunks = math.ceil(duration / chunk_length_sec)
-                    chunk_paths = []
-                    for i in range(num_chunks):
-                        wf.setpos(i * chunk_frames)
-                        frames = wf.readframes(chunk_frames)
-                        chunk_path = f"{audio_path}_chunk_{i+1}.wav"
-                        with wave.open(chunk_path, 'wb') as out_wf:
-                            out_wf.setnchannels(nchannels)
-                            out_wf.setsampwidth(sampwidth)
-                            out_wf.setframerate(framerate)
-                            out_wf.writeframes(frames)
-                        chunk_paths.append(chunk_path)
-                    return chunk_paths
-
-            # Check audio duration
-            with wave.open(audio_path, 'rb') as wf:
-                framerate = wf.getframerate()
-                nframes = wf.getnframes()
-                duration_sec = nframes / float(framerate)
-
-            # If audio is longer than 10 minutes, split into 10-min chunks
-            if duration_sec > 600:
-                self.update_status("Splitting audio into 10-min chunks for parallel batch processing...", percent=10)
-                chunk_paths = split_audio_to_chunks(audio_path, chunk_length_sec=600)
-            else:
-                chunk_paths = [audio_path]
-
-            # Upload all chunks in parallel to blob storage and collect SAS URLs
-            blob_service_client = BlobServiceClient.from_connection_string(storage_connection_string)
-            container_client = blob_service_client.get_container_client(container_name)
-            try:
-                container_client.create_container()
-            except Exception:
-                pass  # Already exists
-
-            def upload_chunk(chunk_path):
-                blob_name = f"{uuid.uuid4()}_{os.path.basename(chunk_path)}"
-                blob_client = container_client.get_blob_client(blob_name)
-                with open(chunk_path, "rb") as data:
-                    blob_client.upload_blob(data, overwrite=True, content_settings=ContentSettings(content_type="audio/wav"))
-                sas_token = generate_blob_sas(
-                    account_name=blob_client.account_name,
-                    container_name=container_name,
-                    blob_name=blob_name,
-                    account_key=blob_service_client.credential.account_key,
-                    permission=BlobSasPermissions(read=True),
-                    expiry=datetime.utcnow() + timedelta(hours=2)
-                )
-                return f"{blob_client.url}?{sas_token}"
-
-            self.update_status("Uploading audio chunks to Azure Blob Storage in parallel...", percent=20)
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                sas_urls = list(executor.map(upload_chunk, chunk_paths))
-
-            # Prepare the API request (use latest API version and correct endpoint)
-            api_version = "2024-11-15"
-            endpoint = f"https://{region}.api.cognitive.microsoft.com/speechtotext/transcriptions:submit?api-version={api_version}"
-            headers = {
-                "Ocp-Apim-Subscription-Key": subscription_key,
-                "Content-Type": "application/json"
-            }
-            body = {
-                "contentUrls": sas_urls,
-                "locale": language or "en-US",
-                "displayName": os.path.basename(audio_path),
-                "properties": {
-                    "displayFormWordLevelTimestampsEnabled": True,
-                    "timeToLiveHours": 48
-                }
-            }
-
-            self.update_status("Submitting batch transcription job...", percent=40)
-            response = requests.post(endpoint, headers=headers, json=body)
-            response.raise_for_status()
-            transcription = response.json()
-            transcription_url = transcription["self"]
-
-            # Poll for completion
-            self.update_status("Processing transcription... (polling)", percent=60)
-            while True:
-                response = requests.get(transcription_url, headers=headers)
-                response.raise_for_status()
-                status = response.json()
-                if status["status"] == "Succeeded":
-                    break
-                elif status["status"] in ["Failed", "Deleted"]:
-                    raise Exception(f"Transcription failed with status: {status['status']}")
-                time.sleep(5)
-
-            # Get results
-            self.update_status("Retrieving transcription results...", percent=90)
-            files_url = status["links"]["files"]
-            response = requests.get(files_url, headers=headers)
-            response.raise_for_status()
-            files = response.json()
-            combined_transcript = []
-            for file in files["values"]:
-                if file["kind"] == "Transcription":
-                    response = requests.get(file["links"]["contentUrl"])
-                    response.raise_for_status()
-                    transcription_result = response.json()
-                    for segment in transcription_result["combinedRecognizedPhrases"]:
-                        combined_transcript.append(segment["display"])
-            self.transcript = " ".join(combined_transcript)
-            self.update_status("Transcription complete", percent=100)
-            # Clean up chunk files if created
-            for chunk_path in chunk_paths:
-                if chunk_path != audio_path and os.path.exists(chunk_path):
+                # Split audio into chunks
+                chunk_paths = split_audio_to_chunks(wav_path, chunk_duration)
+                
+                # Step 4: Transcribe each chunk
+                all_segments = []
+                total_chunks = len(chunk_paths)
+                
+                for i, chunk_path in enumerate(chunk_paths):
+                    chunk_start_time = i * chunk_duration
+                    progress = 20 + (i / total_chunks) * 70  # Progress from 20% to 90%
+                    
+                    self.update_status(f"Transcribing chunk {i+1}/{total_chunks}...", percent=int(progress))
+                    
+                    # Transcribe this chunk
+                    chunk_segments = transcribe_chunk_with_speech_sdk(
+                        chunk_path, i, chunk_start_time, language
+                    )
+                    all_segments.extend(chunk_segments)
+                    
+                    # Clean up chunk file
                     try:
                         os.remove(chunk_path)
                     except Exception:
                         pass
+                
+                # Step 5: Combine results
+                self.update_status("Combining transcription results...", percent=95)
+                self.transcript = combine_transcript_segments(all_segments, chunk_duration)
+                
+            else:
+                # Single file transcription
+                self.update_status("Transcribing with Azure Speech SDK...", percent=30)
+                
+                segments = transcribe_chunk_with_speech_sdk(wav_path, 0, 0, language)
+                self.transcript = combine_transcript_segments(segments, duration)
+            
+            self.update_status("Transcription complete", percent=100)
             return self.transcript
-        except Exception as e:
-            error_msg = f"Error in Azure Speech Batch transcription: {str(e)}"
-            self.update_status(error_msg, percent=0)
-            self.transcript = error_msg
-            return error_msg
+            
+        finally:
+            # Clean up temporary WAV file if created
+            if cleanup_wav and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except Exception:
+                    pass
     
+    def _transcribe_with_azure_openai(self, audio_path, language=None):
+        """DEPRECATED: This method has been replaced by smart chunking with Azure Speech SDK.
+        Use transcribe_audio() method instead which handles all file sizes automatically."""
+        raise NotImplementedError(
+            "Azure OpenAI transcription has been deprecated. "
+            "Use the transcribe_audio() method which automatically handles chunking for large files."
+        )
+
     def _get_ffmpeg_install_instructions(self):
         """Return platform-specific FFmpeg installation instructions."""
         import platform
@@ -2825,24 +2680,13 @@ class MainFrame(wx.Frame):
         threading.Thread(target=self.transcribe_thread, args=(self.audio_file_path.GetValue(), language)).start()
         
     def transcribe_thread(self, file_path, language):
-        """Thread function for audio transcription."""
+        """Thread function for audio transcription using Azure Speech SDK with smart chunking."""
         try:
             # Check if Azure Speech configuration is set
             if not self.config_manager.get_azure_speech_api_key():
                 wx.CallAfter(self.show_azure_speech_config_dialog)
                 return
                 
-            # Check if Azure OpenAI configuration is set
-            if not self.config_manager.get_azure_api_key() or not self.config_manager.get_azure_endpoint():
-                wx.CallAfter(wx.MessageBox, "Please set your Azure OpenAI configuration in the Settings tab.", "Configuration Required", wx.OK | wx.ICON_INFORMATION)
-                return
-                
-            # Get the whisper deployment name
-            whisper_deployment = self.config_manager.get_azure_deployment("whisper")
-            if not whisper_deployment:
-                wx.CallAfter(wx.MessageBox, "Whisper deployment name not configured in Azure OpenAI settings.", "Configuration Error", wx.OK | wx.ICON_ERROR)
-                return
-            
             # Get file extension for better error reporting
             file_ext = os.path.splitext(file_path)[1].lower()
             supported_formats = ['.flac', '.m4a', '.mp3', '.mp4', '.mpeg', '.mpga', '.oga', '.ogg', '.wav', '.webm']
@@ -2869,7 +2713,7 @@ class MainFrame(wx.Frame):
                         wx.CallAfter(self.transcribe_btn.Enable)
                         return
                 else:
-                    error_msg = f"The file format {file_ext} is not supported by Azure OpenAI's Whisper API.\n\nSupported formats: {', '.join(supported_formats)}"
+                    error_msg = f"The file format {file_ext} is not supported.\n\nSupported formats: {', '.join(supported_formats)}"
                     wx.CallAfter(wx.MessageBox, error_msg, "Unsupported Format", wx.OK | wx.ICON_ERROR)
                     wx.CallAfter(self.update_status, "Ready", percent=0)
                     wx.CallAfter(self.transcribe_btn.Enable)
@@ -2892,6 +2736,7 @@ class MainFrame(wx.Frame):
                     # Continue with original file, just log the warning
                     wx.CallAfter(self.update_status, f"Warning: Could not convert M4A file. Attempting to use original file.", percent=20)
             
+            # Use the smart chunking transcription method
             response = self.audio_processor.transcribe_audio(file_path, language)
             
             # Add a note about speaker identification at the top of the transcript
@@ -2922,7 +2767,7 @@ class MainFrame(wx.Frame):
                 # Installation instructions are already in the error message from _get_ffmpeg_install_instructions
             elif file_ext == '.m4a' and 'Invalid file format' in error_msg:
                 error_msg = (
-                    "There was an issue with your M4A file. Some M4A files have compatibility issues with the Azure OpenAI API.\n\n"
+                    "There was an issue with your M4A file. Some M4A files have compatibility issues.\n\n"
                     "Possible solutions:\n"
                     "1. Install FFmpeg on your system (required for m4a processing)\n"
                     "2. Convert the file to WAV or MP3 format manually\n"
@@ -2932,39 +2777,6 @@ class MainFrame(wx.Frame):
                 wx.CallAfter(wx.MessageBox, error_msg, title, wx.OK | wx.ICON_ERROR)
             else:
                 wx.CallAfter(wx.MessageBox, error_msg, title, wx.OK | wx.ICON_ERROR)
-        except openai.RateLimitError:
-            wx.CallAfter(wx.MessageBox, "Azure OpenAI rate limit exceeded. Please try again later.", "Rate Limit Error", wx.OK | wx.ICON_ERROR)
-        except openai.AuthenticationError:
-            wx.CallAfter(wx.MessageBox, "Authentication error. Please check your Azure OpenAI API key in the Settings tab.", "Authentication Error", wx.OK | wx.ICON_ERROR)
-        except openai.BadRequestError as e:
-            error_msg = str(e)
-            title = "API Error"
-            
-            if "Invalid file format" in error_msg:
-                # Try to extract the current format from the error message
-                format_match = re.search(r"supported formats: \[(.*?)\]", error_msg.lower())
-                if format_match:
-                    supported = format_match.group(1)
-                else:
-                    supported = "flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm"
-                
-                if file_ext == '.m4a':
-                    error_msg = (
-                        "Your M4A file format is not compatible with the Azure OpenAI API.\n\n"
-                        "Possible solutions:\n"
-                        "1. Install FFmpeg on your system (required for m4a processing)\n"
-                        "2. Convert the file to WAV or MP3 format manually\n"
-                        "3. Try a different M4A file (some are more compatible than others)"
-                    )
-                    title = "M4A Format Error"
-                else:
-                    error_msg = (
-                        f"The file format {file_ext} is not supported or has compatibility issues.\n\n"
-                        f"Supported formats: {supported}\n\n"
-                        "Recommended: Convert your file to WAV format using FFmpeg."
-                    )
-                    title = "Format Error"
-            wx.CallAfter(wx.MessageBox, error_msg, title, wx.OK | wx.ICON_ERROR)
         except Exception as e:
             error_msg = str(e)
             if 'ffprobe' in error_msg or 'ffmpeg' in error_msg:
@@ -2977,7 +2789,7 @@ class MainFrame(wx.Frame):
         finally:
             wx.CallAfter(self.transcribe_btn.Enable)
             wx.CallAfter(self.update_status, "Ready", percent=0)
-            
+
     def show_speaker_id_hint(self):
         """Show a hint dialog about using speaker identification."""
         # Check if PyAnnote is available
