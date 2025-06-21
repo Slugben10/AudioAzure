@@ -2391,6 +2391,58 @@ class MainFrame(wx.Frame):
         self.transcript_text.SetMinSize((400, 200))
         transcript_sizer.Add(self.transcript_text, 1, wx.EXPAND | wx.ALL, 5)
         
+        # Add Save and Recall buttons below transcript
+        transcript_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        save_transcript_btn = wx.Button(panel, label="Save Transcript")
+        recall_transcript_btn = wx.Button(panel, label="Recall Transcript")
+        transcript_btn_sizer.Add(save_transcript_btn, 0, wx.RIGHT, 5)
+        transcript_btn_sizer.Add(recall_transcript_btn, 0)
+        transcript_sizer.Add(transcript_btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 5)
+
+        # Save transcript handler
+        def on_save_transcript(event):
+            transcript = self.transcript_text.GetValue()
+            if not transcript.strip():
+                wx.MessageBox("No transcript to save.", "Info", wx.OK | wx.ICON_INFORMATION)
+                return
+            import os
+            import datetime
+            base_dir = APP_BASE_DIR if 'APP_BASE_DIR' in globals() else os.path.abspath('.')
+            save_dir = os.path.join(base_dir, "Transcripts")
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(save_dir, f"transcript_{timestamp}.txt")
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(transcript)
+                self.last_saved_transcript_path = filename
+                wx.MessageBox(f"Transcript saved to:\n{filename}", "Success", wx.OK | wx.ICON_INFORMATION)
+            except Exception as e:
+                wx.MessageBox(f"Failed to save transcript: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+        # Recall transcript handler
+        def on_recall_transcript(event):
+            import os
+            with wx.FileDialog(panel, "Open Transcript", defaultDir=os.path.join(APP_BASE_DIR if 'APP_BASE_DIR' in globals() else os.path.abspath('.'), "Transcripts"),
+                              wildcard="Text files (*.txt)|*.txt|All files (*.*)|*.*",
+                              style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as file_dialog:
+                if file_dialog.ShowModal() == wx.ID_CANCEL:
+                    return
+                path = file_dialog.GetPath()
+                if not path or not os.path.exists(path):
+                    wx.MessageBox("Selected transcript file does not exist.", "Error", wx.OK | wx.ICON_ERROR)
+                    return
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    self.transcript_text.SetValue(content)
+                    wx.MessageBox(f"Transcript loaded from:\n{path}", "Success", wx.OK | wx.ICON_INFORMATION)
+                except Exception as e:
+                    wx.MessageBox(f"Failed to load transcript: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+        save_transcript_btn.Bind(wx.EVT_BUTTON, on_save_transcript)
+        recall_transcript_btn.Bind(wx.EVT_BUTTON, on_recall_transcript)
+        
         # Speaker list
         speaker_list_box = wx.StaticBox(panel, label="Speakers")
         speaker_list_sizer = wx.StaticBoxSizer(speaker_list_box, wx.VERTICAL)
@@ -2436,6 +2488,78 @@ class MainFrame(wx.Frame):
         self.summarize_btn.Bind(wx.EVT_BUTTON, self.on_summarize)
         self.summarize_btn.Disable()  # Start disabled
         summary_sizer.Add(self.summarize_btn, 0, wx.EXPAND | wx.ALL, 5)
+
+        # Add Save and Recall buttons for summary
+        summary_btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        save_summary_btn = wx.Button(panel, label="Save Summary")
+        recall_summary_btn = wx.Button(panel, label="Recall Summary")
+        summary_btn_sizer.Add(save_summary_btn, 0, wx.RIGHT, 5)
+        summary_btn_sizer.Add(recall_summary_btn, 0)
+        summary_sizer.Add(summary_btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 5)
+
+        # Save summary handler
+        def on_save_summary(event):
+            # Try to get summary from the last summary dialog if possible, else from transcript_text
+            summary = None
+            if hasattr(self, 'last_summary_text') and self.last_summary_text:
+                summary = self.last_summary_text
+            else:
+                summary = self.transcript_text.GetValue()
+            if not summary.strip():
+                wx.MessageBox("No summary to save.", "Info", wx.OK | wx.ICON_INFORMATION)
+                return
+            import os
+            import datetime
+            base_dir = APP_BASE_DIR if 'APP_BASE_DIR' in globals() else os.path.abspath('.')
+            save_dir = os.path.join(base_dir, "Summaries")
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(save_dir, f"summary_{timestamp}.txt")
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(summary)
+                self.last_saved_summary_path = filename
+                wx.MessageBox(f"Summary saved to:\n{filename}", "Success", wx.OK | wx.ICON_INFORMATION)
+            except Exception as e:
+                wx.MessageBox(f"Failed to save summary: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+        # Recall summary handler
+        def on_recall_summary(event):
+            import os
+            with wx.FileDialog(panel, "Open Summary", defaultDir=os.path.join(APP_BASE_DIR if 'APP_BASE_DIR' in globals() else os.path.abspath('.'), "Summaries"),
+                              wildcard="Text files (*.txt)|*.txt|All files (*.*)|*.*",
+                              style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as file_dialog:
+                if file_dialog.ShowModal() == wx.ID_CANCEL:
+                    return
+                path = file_dialog.GetPath()
+                if not path or not os.path.exists(path):
+                    wx.MessageBox("Selected summary file does not exist.", "Error", wx.OK | wx.ICON_ERROR)
+                    return
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    # Store for later use
+                    self.last_summary_text = content
+                    # Show in a dialog (like show_summary_dialog)
+                    dlg = wx.Dialog(panel, title="Summary", size=(600, 400))
+                    sizer = wx.BoxSizer(wx.VERTICAL)
+                    text_ctrl = wx.TextCtrl(dlg, style=wx.TE_MULTILINE | wx.TE_READONLY)
+                    text_ctrl.SetValue(content)
+                    sizer.Add(text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+                    btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+                    close_btn = wx.Button(dlg, wx.ID_CLOSE)
+                    btn_sizer.Add(close_btn, 0, wx.ALL, 5)
+                    sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 5)
+                    dlg.SetSizer(sizer)
+                    close_btn.Bind(wx.EVT_BUTTON, lambda event: dlg.EndModal(wx.ID_CLOSE))
+                    dlg.ShowModal()
+                    dlg.Destroy()
+                    wx.MessageBox(f"Summary loaded from:\n{path}", "Success", wx.OK | wx.ICON_INFORMATION)
+                except Exception as e:
+                    wx.MessageBox(f"Failed to load summary: {e}", "Error", wx.OK | wx.ICON_ERROR)
+
+        save_summary_btn.Bind(wx.EVT_BUTTON, on_save_summary)
+        recall_summary_btn.Bind(wx.EVT_BUTTON, on_recall_summary)
         
         sizer.Add(summary_sizer, 0, wx.EXPAND | wx.ALL, 5)
         
