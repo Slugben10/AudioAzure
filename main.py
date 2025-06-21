@@ -2548,15 +2548,7 @@ class MainFrame(wx.Frame):
                 
             # Check file size
             file_size_mb = os.path.getsize(path) / (1024 * 1024)
-            if file_size_mb > 25:
-                wx.MessageBox(
-                    f"The selected file is {file_size_mb:.1f}MB, which exceeds the 25MB limit for OpenAI's Whisper API.\n"
-                    f"Please choose a smaller file or compress this one.",
-                    "File Too Large",
-                    wx.OK | wx.ICON_WARNING
-                )
-                return
-                
+            # Removed 25MB Whisper API limit check to allow large files for Azure Speech SDK
             self.audio_file_path.SetValue(path)
             self.update_status(f"Selected audio file: {os.path.basename(path)} ({file_size_mb:.1f}MB)", percent=0)
             self.update_button_states()
