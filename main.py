@@ -980,36 +980,191 @@ class MainFrame(wx.Frame):
         # Add placeholder method if not exists
         if not hasattr(self, 'create_settings_panel'):
             def create_settings_panel(self):
+                import wx
+                import copy
+                try:
+                    from wx.lib.scrolledpanel import ScrolledPanel
+                    ScrolledPanelClass = ScrolledPanel
+                except ImportError:
+                    ScrolledPanelClass = wx.ScrolledWindow
+
+                # Remove previous children
+                for child in self.settings_panel.GetChildren():
+                    child.Destroy()
+
+                # Create a scrolled panel inside the settings tab
+                self._settings_scroll = ScrolledPanelClass(self.settings_panel, style=wx.TAB_TRAVERSAL)
+                self._settings_scroll.SetBackgroundColour(self.settings_panel.GetBackgroundColour())
+                if hasattr(self._settings_scroll, 'SetupScrolling'):
+                    self._settings_scroll.SetupScrolling(scroll_x=False, scroll_y=True)
+                else:
+                    self._settings_scroll.SetScrollRate(0, 20)
+
+                def make_label(key):
+                    return wx.StaticText(self._settings_scroll, label=key.replace('_', ' ').capitalize() + ':')
+
+                self._settings_widgets = {}
+
+                def build_fields(parent_sizer, config_dict, widgets_dict, path=[]):
+                    for key, value in config_dict.items():
+                        field_path = path + [key]
+                        if isinstance(value, dict):
+                            box = wx.StaticBox(self._settings_scroll, label=key.replace('_', ' ').capitalize())
+                            box_sizer = wx.StaticBoxSizer(box, wx.VERTICAL)
+                            widgets_dict[key] = {}
+                            build_fields(box_sizer, value, widgets_dict[key], field_path)
+                            parent_sizer.Add(box_sizer, 0, wx.EXPAND | wx.ALL, 5)
+                        elif isinstance(value, bool):
+                            cb = wx.CheckBox(self._settings_scroll, label=key.replace('_', ' ').capitalize())
+                            cb.SetValue(value)
+                            widgets_dict[key] = cb
+                            parent_sizer.Add(cb, 0, wx.ALL, 5)
+                        elif isinstance(value, (int, float)):
+                            parent_sizer.Add(make_label(key), 0, wx.ALL, 5)
+                            tc = wx.TextCtrl(self._settings_scroll)
+                            tc.SetValue(str(value))
+                            widgets_dict[key] = tc
+                            parent_sizer.Add(tc, 0, wx.EXPAND | wx.ALL, 5)
+                        elif isinstance(value, str):
+                            parent_sizer.Add(make_label(key), 0, wx.ALL, 5)
+                            style = wx.TE_PASSWORD if 'key' in key.lower() or 'token' in key.lower() else 0
+                            tc = wx.TextCtrl(self._settings_scroll, style=style)
+                            tc.SetValue(value)
+                            widgets_dict[key] = tc
+                            parent_sizer.Add(tc, 0, wx.EXPAND | wx.ALL, 5)
+                        elif isinstance(value, list):
+                            parent_sizer.Add(make_label(key), 0, wx.ALL, 5)
+                            tc = wx.TextCtrl(self._settings_scroll)
+                            tc.SetValue(json.dumps(value))
+                            widgets_dict[key] = tc
+                            parent_sizer.Add(tc, 0, wx.EXPAND | wx.ALL, 5)
+                        else:
+                            parent_sizer.Add(make_label(key), 0, wx.ALL, 5)
+                            tc = wx.TextCtrl(self._settings_scroll)
+                            tc.SetValue(str(value))
+                            widgets_dict[key] = tc
+                            parent_sizer.Add(tc, 0, wx.EXPAND | wx.ALL, 5)
+
+                def build_templates_section(parent_sizer, templates_dict, widgets_dict):
+                    box = wx.StaticBox(self._settings_scroll, label='Templates')
+                    box_sizer = wx.StaticBoxSizer(box, wx.VERTICAL)
+                    widgets_dict.clear()
+                    self._template_rows = []
+                    for name, content in templates_dict.items():
+                        row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+                        name_tc = wx.TextCtrl(self._settings_scroll)
+                        name_tc.SetValue(name)
+                        content_tc = wx.TextCtrl(self._settings_scroll, style=wx.TE_MULTILINE)
+                        content_tc.SetValue(content)
+                        row_sizer.Add(name_tc, 1, wx.EXPAND | wx.ALL, 2)
+                        row_sizer.Add(content_tc, 2, wx.EXPAND | wx.ALL, 2)
+                        remove_btn = wx.Button(self._settings_scroll, label='Remove')
+                        row_sizer.Add(remove_btn, 0, wx.ALL, 2)
+                        def make_remove_handler(n=name):
+                            def handler(evt):
+                                del widgets_dict[n]
+                                # Also remove from config before rebuild
+                                if 'templates' in self.config_manager.config and n in self.config_manager.config['templates']:
+                                    del self.config_manager.config['templates'][n]
+                                self.create_settings_panel()
+                            return handler
+                        remove_btn.Bind(wx.EVT_BUTTON, make_remove_handler(name))
+                        box_sizer.Add(row_sizer, 0, wx.EXPAND | wx.ALL, 2)
+                        widgets_dict[name] = (name_tc, content_tc)
+                        self._template_rows.append((row_sizer, name_tc, content_tc, remove_btn))
+                    new_row = wx.BoxSizer(wx.HORIZONTAL)
+                    new_name = wx.TextCtrl(self._settings_scroll)
+                    new_content = wx.TextCtrl(self._settings_scroll, style=wx.TE_MULTILINE)
+                    add_btn = wx.Button(self._settings_scroll, label='Add')
+                    def on_add(evt):
+                        n = new_name.GetValue().strip()
+                        c = new_content.GetValue().strip()
+                        if n and c:
+                            # Add to config immediately so it persists on refresh
+                            if 'templates' not in self.config_manager.config:
+                                self.config_manager.config['templates'] = {}
+                            self.config_manager.config['templates'][n] = c
+                            self.create_settings_panel()
+                    add_btn.Bind(wx.EVT_BUTTON, on_add)
+                    new_row.Add(new_name, 1, wx.EXPAND | wx.ALL, 2)
+                    new_row.Add(new_content, 2, wx.EXPAND | wx.ALL, 2)
+                    new_row.Add(add_btn, 0, wx.ALL, 2)
+                    box_sizer.Add(new_row, 0, wx.EXPAND | wx.ALL, 2)
+                    parent_sizer.Add(box_sizer, 0, wx.EXPAND | wx.ALL, 5)
+
                 settings_sizer = wx.BoxSizer(wx.VERTICAL)
-                
-                # Create actual content instead of just a placeholder
-                # Azure OpenAI API Key
-                azure_key_label = wx.StaticText(self.settings_panel, label="Azure OpenAI API Key:")
-                self.azure_api_key_input = wx.TextCtrl(self.settings_panel, style=wx.TE_PASSWORD)
-                self.azure_api_key_input.SetValue(self.config_manager.get_azure_api_key())
-                
-                # Azure OpenAI Endpoint
-                azure_endpoint_label = wx.StaticText(self.settings_panel, label="Azure OpenAI Endpoint:")
-                self.azure_endpoint_input = wx.TextCtrl(self.settings_panel)
-                self.azure_endpoint_input.SetValue(self.config_manager.get_azure_endpoint())
-                
-                # HuggingFace API Key
-                hf_label = wx.StaticText(self.settings_panel, label="HuggingFace Token:")
-                self.hf_input = wx.TextCtrl(self.settings_panel, style=wx.TE_PASSWORD)
-                self.hf_input.SetValue(self.config_manager.get_pyannote_token())
-                
-                # Add elements to sizer
-                settings_sizer.Add(azure_key_label, 0, wx.ALL, 5)
-                settings_sizer.Add(self.azure_api_key_input, 0, wx.EXPAND | wx.ALL, 5)
-                settings_sizer.Add(azure_endpoint_label, 0, wx.ALL, 5)
-                settings_sizer.Add(self.azure_endpoint_input, 0, wx.EXPAND | wx.ALL, 5)
-                settings_sizer.Add(hf_label, 0, wx.ALL, 5)
-                settings_sizer.Add(self.hf_input, 0, wx.EXPAND | wx.ALL, 5)
-                
-                # Add the prominent save button
-                settings_sizer.Add(add_save_all_settings_button(self.settings_panel, self), 0, wx.EXPAND)
-                
-                self.settings_panel.SetSizer(settings_sizer)
+                config = copy.deepcopy(self.config_manager.config)
+                if 'templates' in config:
+                    templates = config.pop('templates')
+                else:
+                    templates = None
+                build_fields(settings_sizer, config, self._settings_widgets)
+                if templates is not None:
+                    self._settings_widgets['templates'] = {}
+                    build_templates_section(settings_sizer, templates, self._settings_widgets['templates'])
+                save_btn = wx.Button(self._settings_scroll, label='Save All Settings')
+                def on_save(evt):
+                    def extract(widgets, orig):
+                        result = type(orig)() if isinstance(orig, dict) else None
+                        for k, v in widgets.items():
+                            if isinstance(v, dict):
+                                result[k] = extract(v, orig[k])
+                            elif isinstance(v, wx.TextCtrl):
+                                val = v.GetValue()
+                                if isinstance(orig[k], bool):
+                                    result[k] = val.lower() in ('1', 'true', 'yes', 'on')
+                                elif isinstance(orig[k], int):
+                                    try: result[k] = int(val)
+                                    except: result[k] = 0
+                                elif isinstance(orig[k], float):
+                                    try: result[k] = float(val)
+                                    except: result[k] = 0.0
+                                elif isinstance(orig[k], list):
+                                    try: result[k] = json.loads(val)
+                                    except: result[k] = []
+                                else:
+                                    result[k] = val
+                            elif isinstance(v, wx.CheckBox):
+                                result[k] = v.GetValue()
+                        return result
+                    new_config = extract(self._settings_widgets, self.config_manager.config)
+                    if 'templates' in self._settings_widgets:
+                        templates = {}
+                        for name, (name_tc, content_tc) in self._settings_widgets['templates'].items():
+                            n = name_tc.GetValue().strip()
+                            c = content_tc.GetValue().strip()
+                            if n and c:
+                                templates[n] = c
+                        new_config['templates'] = templates
+                    self.config_manager.save_config(new_config)
+                    self.config_manager.config = new_config
+                    if hasattr(self, 'client'):
+                        try:
+                            self.client = AzureOpenAI(
+                                api_key=new_config.get('azure_api_key', ''),
+                                api_version=new_config.get('azure_api_version', '2023-05-15'),
+                                azure_endpoint=new_config.get('azure_endpoint', '')
+                            )
+                        except Exception as e:
+                            self.show_error(f"Error setting Azure OpenAI client: {e}")
+                    if hasattr(self, 'audio_processor'):
+                        self.audio_processor.config_manager = self.config_manager
+                        self.audio_processor.initialize_speech_client()
+                    # Refresh template dropdowns in the app if present
+                    if hasattr(self, 'template_choice'):
+                        templates = list(new_config.get('templates', {}).keys())
+                        self.template_choice.SetItems(["None"] + templates)
+                        self.template_choice.SetSelection(0)
+                    wx.MessageBox("Settings saved successfully!", "Success", wx.OK | wx.ICON_INFORMATION)
+                    self.status_bar.SetStatusText("Settings saved successfully")
+                save_btn.Bind(wx.EVT_BUTTON, on_save)
+                settings_sizer.Add(save_btn, 0, wx.EXPAND | wx.ALL, 10)
+                self._settings_scroll.SetSizer(settings_sizer)
+                self._settings_scroll.Layout()
+                panel_sizer = wx.BoxSizer(wx.VERTICAL)
+                panel_sizer.Add(self._settings_scroll, 1, wx.EXPAND | wx.ALL, 0)
+                self.settings_panel.SetSizer(panel_sizer)
+                self.settings_panel.Layout()
             self.create_settings_panel = types.MethodType(create_settings_panel, self)
         self.create_settings_panel()
         
