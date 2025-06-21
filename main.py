@@ -87,6 +87,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 import math
+import concurrent.futures
 
 # Make wx imports without errors
 try:
@@ -583,7 +584,7 @@ class AudioProcessor:
             raise RuntimeError(f"Error during audio conversion: {e.stderr.decode('utf-8', errors='replace')}")
     
     def transcribe_audio(self, audio_path, language=None):
-        """Transcribe audio file using Azure Speech SDK with smart chunking for large files."""
+        """Transcribe audio file using Azure Speech SDK with strict 10-minute chunking and parallel processing for large files."""
         import os
         import wave
         import math
@@ -593,6 +594,7 @@ class AudioProcessor:
         import time
         from dataclasses import dataclass
         from typing import List, Tuple
+        import concurrent.futures
 
         @dataclass
         class TranscriptionSegment:
@@ -621,26 +623,6 @@ class AudioProcessor:
             subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
             return out_path
 
-        def calculate_optimal_chunk_size(duration_sec, size_mb):
-            """Calculate optimal chunk size based on duration and size limits."""
-            # Limits: 300MB and 7200 seconds (2 hours)
-            max_duration = 7200  # 2 hours in seconds
-            max_size_mb = 300
-            
-            # Calculate chunk size based on duration
-            duration_based_chunks = math.ceil(duration_sec / max_duration)
-            
-            # Calculate chunk size based on file size
-            size_based_chunks = math.ceil(size_mb / max_size_mb)
-            
-            # Use the larger number of chunks to ensure both limits are met
-            num_chunks = max(duration_based_chunks, size_based_chunks)
-            
-            # Calculate chunk duration, ensuring it doesn't exceed max_duration
-            chunk_duration = min(duration_sec / num_chunks, max_duration)
-            
-            return int(chunk_duration)
-
         def split_audio_to_chunks(wav_path, chunk_sec):
             """Split audio into chunks of specified duration in seconds."""
             with wave.open(wav_path, 'rb') as wf:
@@ -649,106 +631,69 @@ class AudioProcessor:
                 nchannels = wf.getnchannels()
                 sampwidth = wf.getsampwidth()
                 duration = nframes / float(framerate)
-                
                 chunk_frames = int(chunk_sec * framerate)
                 num_chunks = math.ceil(duration / chunk_sec)
                 chunk_paths = []
-                
                 for i in range(num_chunks):
                     start_frame = i * chunk_frames
                     wf.setpos(start_frame)
-                    
-                    # Read frames for this chunk
                     frames_to_read = min(chunk_frames, nframes - start_frame)
                     frames = wf.readframes(frames_to_read)
-                    
-                    # Create temporary chunk file
                     chunk_path = tempfile.mktemp(suffix=f'_chunk_{i+1:03d}.wav')
                     with wave.open(chunk_path, 'wb') as out_wf:
                         out_wf.setnchannels(nchannels)
                         out_wf.setsampwidth(sampwidth)
                         out_wf.setframerate(framerate)
                         out_wf.writeframes(frames)
-                    
                     chunk_paths.append(chunk_path)
-                
                 return chunk_paths
 
         def transcribe_chunk_with_speech_sdk(chunk_path, chunk_index, chunk_start_time, language=None):
             """Transcribe a single chunk using Azure Speech SDK."""
             try:
                 import azure.cognitiveservices.speech as speechsdk
-                
-                # Get Azure Speech configuration
                 speech_config = self.config_manager.get_azure_speech_config()
                 api_key = speech_config["api_key"]
                 region = speech_config["region"]
-                
-                # Configure speech recognition
                 speech_config_obj = speechsdk.SpeechConfig(subscription=api_key, region=region)
                 audio_input = speechsdk.AudioConfig(filename=chunk_path)
                 recognizer = speechsdk.SpeechRecognizer(speech_config=speech_config_obj, audio_config=audio_input)
-                
-                # Set language if specified
                 if language:
                     speech_config_obj.speech_recognition_language = language
-                
-                # Collect transcription results
                 segments = []
                 done = threading.Event()
-                
                 def handle_final(evt):
                     if evt.result.text:
-                        # Calculate timing relative to the original audio
                         segment_start = chunk_start_time
                         segment_end = chunk_start_time + (len(segments) * 2.0)  # Approximate timing
-                        
                         segments.append(TranscriptionSegment(
                             text=evt.result.text,
                             start_time=segment_start,
                             end_time=segment_end,
                             chunk_index=chunk_index
                         ))
-                
                 def handle_session_stopped(evt):
                     done.set()
-                
                 def handle_canceled(evt):
                     done.set()
-                
-                # Connect event handlers
                 recognizer.recognized.connect(handle_final)
                 recognizer.session_stopped.connect(handle_session_stopped)
                 recognizer.canceled.connect(handle_canceled)
-                
-                # Start recognition
                 recognizer.start_continuous_recognition()
                 done.wait()
                 recognizer.stop_continuous_recognition()
-                
                 return segments
-                
             except Exception as e:
                 self.update_status(f"Error transcribing chunk {chunk_index}: {str(e)}", percent=None)
                 return []
 
-        def combine_transcript_segments(segments, chunk_duration):
-            """Combine transcription segments from multiple chunks into a single transcript."""
+        def combine_transcript_segments(segments):
             if not segments:
                 return ""
-            
-            # Sort segments by chunk index and timing
             sorted_segments = sorted(segments, key=lambda s: (s.chunk_index, s.start_time))
-            
-            # Combine text with proper spacing
             combined_text = []
             for segment in sorted_segments:
-                # Add chunk separator for debugging (optional)
-                # if segment.chunk_index > 0 and segment.start_time == 0:
-                #     combined_text.append(f"\n[Chunk {segment.chunk_index}]\n")
-                
                 combined_text.append(segment.text)
-            
             return " ".join(combined_text)
 
         # Step 1: Convert to WAV if needed
@@ -762,63 +707,47 @@ class AudioProcessor:
             cleanup_wav = False
 
         try:
-            # Step 2: Analyze audio file
             self.update_status("Analyzing audio file...", percent=10)
             duration, size_mb = get_wav_duration_and_size(wav_path)
-            
             self.update_status(f"Audio: {duration:.1f}s, {size_mb:.1f}MB", percent=15)
-            
-            # Step 3: Determine if chunking is needed
-            needs_chunking = duration > 7200 or size_mb > 300
-            
+            needs_chunking = duration > 600  # 10 minutes
             if needs_chunking:
-                # Calculate optimal chunk size
-                chunk_duration = calculate_optimal_chunk_size(duration, size_mb)
+                chunk_duration = 600  # 10 minutes
                 num_chunks = math.ceil(duration / chunk_duration)
-                
-                self.update_status(f"Splitting audio into {num_chunks} chunks of ~{chunk_duration}s each...", percent=20)
-                
-                # Split audio into chunks
+                self.update_status(f"Splitting audio into {num_chunks} chunks of 10 minutes each...", percent=20)
                 chunk_paths = split_audio_to_chunks(wav_path, chunk_duration)
-                
-                # Step 4: Transcribe each chunk
                 all_segments = []
                 total_chunks = len(chunk_paths)
-                
-                for i, chunk_path in enumerate(chunk_paths):
+                # Parallel transcription (up to 6 workers)
+                def transcribe_one(args):
+                    chunk_path, i = args
                     chunk_start_time = i * chunk_duration
-                    progress = 20 + (i / total_chunks) * 70  # Progress from 20% to 90%
-                    
-                    self.update_status(f"Transcribing chunk {i+1}/{total_chunks}...", percent=int(progress))
-                    
-                    # Transcribe this chunk
-                    chunk_segments = transcribe_chunk_with_speech_sdk(
-                        chunk_path, i, chunk_start_time, language
-                    )
-                    all_segments.extend(chunk_segments)
-                    
-                    # Clean up chunk file
-                    try:
-                        os.remove(chunk_path)
-                    except Exception:
-                        pass
-                
-                # Step 5: Combine results
+                    return transcribe_chunk_with_speech_sdk(chunk_path, i, chunk_start_time, language)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                    futures = {executor.submit(transcribe_one, (chunk_path, i)): (chunk_path, i) for i, chunk_path in enumerate(chunk_paths)}
+                    for idx, future in enumerate(concurrent.futures.as_completed(futures)):
+                        chunk_path, i = futures[future]
+                        progress = 20 + ((idx + 1) / total_chunks) * 70  # Progress from 20% to 90%
+                        self.update_status(f"Transcribing chunk {i+1}/{total_chunks}...", percent=int(progress))
+                        try:
+                            chunk_segments = future.result()
+                            all_segments.extend(chunk_segments)
+                        except Exception as e:
+                            self.update_status(f"Error in chunk {i+1}: {str(e)}", percent=None)
+                        # Clean up chunk file
+                        try:
+                            os.remove(chunk_path)
+                        except Exception:
+                            pass
                 self.update_status("Combining transcription results...", percent=95)
-                self.transcript = combine_transcript_segments(all_segments, chunk_duration)
-                
+                self.transcript = combine_transcript_segments(all_segments)
             else:
-                # Single file transcription
                 self.update_status("Transcribing with Azure Speech SDK...", percent=30)
-                
                 segments = transcribe_chunk_with_speech_sdk(wav_path, 0, 0, language)
-                self.transcript = combine_transcript_segments(segments, duration)
-            
+                self.transcript = combine_transcript_segments(segments)
             self.update_status("Transcription complete", percent=100)
             return self.transcript
-            
         finally:
-            # Clean up temporary WAV file if created
             if cleanup_wav and os.path.exists(wav_path):
                 try:
                     os.remove(wav_path)
