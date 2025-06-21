@@ -3943,8 +3943,7 @@ class LLMProcessor:
                     {"role": "system", "content": "You are an assistant that specializes in summarizing transcripts."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.5,
-                api_version=self.config_manager.get_azure_api_version()
+                temperature=0.5
             )
             
             summary = response.choices[0].message.content
